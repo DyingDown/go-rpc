@@ -34,15 +34,12 @@ func main() {
 	json.NewEncoder(conn).Encode(gorpc.DefaultOption)
 	cc := codec.NewGobCodec(conn)
 	for i := 0; i < 5; i++ {
-		logrus.Info(i)
 		header := &codec.Header{
 			ServiceMethod: "Foo.Sum",
 			Seq:           uint64(i),
 		}
 		cc.Write(header, fmt.Sprintf("%v", header.Seq))
-		logrus.Info("write finished")
 		cc.ReadHeader(header)
-		logrus.Info(("read header done"))
 		var reply string
 		cc.ReadBody(reply)
 		logrus.Infof("reply: %v", reply)

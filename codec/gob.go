@@ -10,7 +10,7 @@ import (
 
 type GobCodec struct {
 	conn io.ReadWriteCloser
-	buff bufio.Writer
+	buff *bufio.Writer
 	dec  *gob.Decoder
 	enc  *gob.Encoder
 }
@@ -21,17 +21,14 @@ func NewGobCodec(conn io.ReadWriteCloser) Codec {
 	buf := bufio.NewWriter(conn)
 	return &GobCodec{
 		conn: conn,
-		buff: *buf,
+		buff: buf,
 		dec:  gob.NewDecoder(conn),
 		enc:  gob.NewEncoder(buf),
 	}
 }
 
 func (codec *GobCodec) ReadHeader(h *Header) error {
-	logrus.Info("read header456")
-	err := codec.dec.Decode(h)
-	logrus.Info("decode done")
-	return err
+	return codec.dec.Decode(h)
 }
 
 func (codec *GobCodec) ReadBody(body interface{}) error {
