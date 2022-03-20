@@ -2,11 +2,12 @@ package gorpc
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"go-rpc/codec"
 	"io"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -27,9 +28,13 @@ var DefaultOption = &Option{
 type Request struct {
 	header               *codec.Header
 	argValue, replyValue reflect.Value
+	mt                   *MethodType
+	service              *service
 }
 
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
 
 var invalidRequest = struct{}{}
 
@@ -93,14 +98,14 @@ func (s *Server) handleCodec(codec codec.Codec) {
 }
 
 func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
-	var header = new(codec.Header)
-	if err := cc.ReadHeader(header); err != nil {
+	var header codec.Header
+	if err := cc.ReadHeader(&header); err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return nil, err
 		}
 		logrus.Errorf("fail to read header: %v", err)
 	}
-	return header, nil
+	return &header, nil
 }
 
 func (s *Server) readRequest(codec codec.Codec) (*Request, error) {
@@ -108,14 +113,21 @@ func (s *Server) readRequest(codec codec.Codec) (*Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	argv := reflect.New(reflect.TypeOf(""))
-	if err := codec.ReadBody(argv.Interface()); err != nil {
-		logrus.Errorf("fail to read body: %v", err)
+	r := &Request{}
+	r.header = header
+	r.service, r.mt, err = s.FindService(header.ServiceMethod)
+	if err != nil {
+		return r, err
 	}
-	return &Request{
-		header:   header,
-		argValue: argv,
-	}, nil
+	r.argValue = r.mt.newArgv()
+	r.replyValue = r.mt.newReplyv()
+
+	argV := r.argValue.Interface()
+	if err := codec.ReadBody(argV); err != nil {
+		logrus.Error("server: read request body err: %v", err)
+		return r, err
+	}
+	return r, nil
 }
 
 func (s *Server) sendResponse(codec codec.Codec, header *codec.Header, body interface{}, sending *sync.Mutex) {
@@ -128,7 +140,42 @@ func (s *Server) sendResponse(codec codec.Codec, header *codec.Header, body inte
 
 func (s *Server) handleRequest(codec codec.Codec, request *Request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	logrus.Info(request.header, request.argValue.Elem())
-	request.replyValue = reflect.ValueOf(fmt.Sprintf("%s", request.header.Seq))
+	err := request.service.Call(request.mt, request.argValue, request.replyValue)
+	if err != nil {
+		request.header.Error = err.Error()
+		s.sendResponse(codec, request.header, invalidRequest, sending)
+		return
+	}
 	s.sendResponse(codec, request.header, request.replyValue.Interface(), sending)
+}
+
+func (s *Server) Register(serviceStruct interface{}) error {
+	service := NewService(serviceStruct)
+	if _, ok := s.serviceMap.LoadOrStore(service.name, service); ok {
+		return errors.New("service all ready registered")
+	}
+	return nil
+}
+
+func Register(serviceStruct interface{}) error {
+	return DefaultServer.Register(serviceStruct)
+}
+
+func (s *Server) FindService(serviceMethod string) (*service, *MethodType, error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		return nil, nil, errors.New("service method has illegal formate" + serviceMethod)
+	}
+	serviceName := serviceMethod[:dot]
+	methodName := serviceMethod[dot+1:]
+	serviceInter, ok := s.serviceMap.Load(serviceName)
+	if !ok {
+		return nil, nil, errors.New("server: service " + serviceName + " can't be found")
+	}
+	service := serviceInter.(*service)
+	methodType := service.method[methodName]
+	if methodType == nil {
+		return nil, nil, errors.New("server: service method " + methodName + " can't be found")
+	}
+	return service, methodType, nil
 }
