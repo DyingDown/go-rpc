@@ -1,12 +1,18 @@
 package gorpc
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go-rpc/codec"
 	"io"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -18,10 +24,6 @@ type Call struct {
 	Reply         interface{}
 	Error         error
 	Done          chan *Call
-}
-
-func (call *Call) done() {
-	call.Done <- call
 }
 
 type Client struct {
@@ -36,9 +38,20 @@ type Client struct {
 	shutdown bool
 }
 
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type NewClientFunc func(conn net.Conn, option *Option) (client *Client, err error)
+
 var _ io.Closer = (*Client)(nil)
 
 var ShutDownErr = errors.New("connection is shut down")
+
+func (call *Call) done() {
+	call.Done <- call
+}
 
 func (client *Client) Close() error {
 	client.mu.Lock()
@@ -50,7 +63,7 @@ func (client *Client) Close() error {
 	return client.cc.Close()
 }
 
-func (client *Client) isOnWork() bool {
+func (client *Client) IsOnWork() bool {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	return !client.closing && !client.shutdown
@@ -158,20 +171,39 @@ func parseOption(options ...*Option) (*Option, error) {
 }
 
 func Dial(network, addr string, opts ...*Option) (client *Client, err error) {
-	option, err := parseOption(opts...)
+	return dialTimeout(NewClient, network, addr, opts...)
+}
+
+func dialTimeout(f NewClientFunc, network, address string, options ...*Option) (client *Client, error error) {
+	option, err := parseOption(options...)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.Dial(network, addr)
+	conn, err := net.DialTimeout(network, address, option.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if client == nil {
+		if err != nil {
 			conn.Close()
 		}
 	}()
-	return NewClient(conn, option)
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, option)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if option.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(option.ConnectTimeout):
+		logrus.Error("timeout")
+		return nil, errors.New("client: connection time out, expected within" + option.ConnectTimeout.String())
+	case result := <-ch:
+		return result.client, result.err
+	}
 }
 
 func (client *Client) send(call *Call) {
@@ -213,7 +245,42 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 	return call
 }
 
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (client *Client) Call(contex context.Context, serviceMethod string, args, reply interface{}) error {
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-contex.Done():
+		return errors.New("client: call timeout: " + contex.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
+}
+
+func NewHTTPClient(conn net.Conn, option *Option) (*Client, error) {
+	io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+	respons, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && respons.Status == connected {
+		return NewClient(conn, option)
+	}
+	if err == nil {
+		err = errors.New("unexpected http status: " + respons.Status)
+	}
+	return nil, err
+}
+
+func DialHTTP(network, addr string, option ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, addr, option...)
+}
+
+func XDial(rpcAddr string, options ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, errors.New("invalid address formate: " + rpcAddr + ". expected protocal@address")
+	}
+	protocal := parts[0]
+	addr := parts[1]
+	if protocal == "http" {
+		return DialHTTP("tcp", addr, options...)
+	} else {
+		return Dial(protocal, addr, options...)
+	}
 }

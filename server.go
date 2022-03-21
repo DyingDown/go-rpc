@@ -6,23 +6,34 @@ import (
 	"go-rpc/codec"
 	"io"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
 
+const (
+	connected        = "200 connected to go rpc"
+	defaultRPCPath   = "/go_rpc"
+	defaultDebugPath = "/debug/go_rpc"
+)
+
 type Option struct {
-	MagicNumber int
-	CodecType   codec.Type
+	MagicNumber    int
+	CodecType      codec.Type
+	ConnectTimeout time.Duration
+	HandleTimeOout time.Duration
 }
 
 const MagicNumber = 0
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 type Request struct {
@@ -71,14 +82,14 @@ func (s *Server) handleConn(conn io.ReadWriteCloser) {
 		logrus.Errorf("invalid codec type: %v", option.CodecType)
 		return
 	}
-	s.handleCodec(codecfunc(conn))
+	s.handleCodec(codecfunc(conn), &option)
 }
 
 func Accept(listener net.Listener) {
 	DefaultServer.Accept(listener)
 }
 
-func (s *Server) handleCodec(codec codec.Codec) {
+func (s *Server) handleCodec(codec codec.Codec, option *Option) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
@@ -92,7 +103,7 @@ func (s *Server) handleCodec(codec codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go s.handleRequest(codec, request, sending, wg)
+		go s.handleRequest(codec, request, sending, wg, option.HandleTimeOout)
 	}
 	wg.Wait()
 }
@@ -123,8 +134,11 @@ func (s *Server) readRequest(codec codec.Codec) (*Request, error) {
 	r.replyValue = r.mt.newReplyv()
 
 	argV := r.argValue.Interface()
+	if r.argValue.Kind() != reflect.Ptr {
+		argV = r.argValue.Addr().Interface()
+	}
 	if err := codec.ReadBody(argV); err != nil {
-		logrus.Error("server: read request body err: %v", err)
+		logrus.Errorf("server: read request body err: %v", err)
 		return r, err
 	}
 	return r, nil
@@ -138,15 +152,37 @@ func (s *Server) sendResponse(codec codec.Codec, header *codec.Header, body inte
 	}
 }
 
-func (s *Server) handleRequest(codec codec.Codec, request *Request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (s *Server) handleRequest(codec codec.Codec, request *Request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := request.service.Call(request.mt, request.argValue, request.replyValue)
-	if err != nil {
-		request.header.Error = err.Error()
-		s.sendResponse(codec, request.header, invalidRequest, sending)
+	// called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := request.service.Call(request.mt, request.argValue, request.replyValue)
+		// called <- struct{}{}
+		if err != nil {
+			request.header.Error = err.Error()
+			s.sendResponse(codec, request.header, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		s.sendResponse(codec, request.header, request.replyValue.Interface(), sending)
+		sent <- struct{}{}
+	}()
+	if timeout == 0 {
+		// <-called
+		<-sent
 		return
 	}
-	s.sendResponse(codec, request.header, request.replyValue.Interface(), sending)
+	select {
+	case <-time.After(timeout):
+		request.header.Error = "server: handle request timeout: expected within " + timeout.String()
+		s.sendResponse(codec, request.header, request.replyValue.Interface(), sending)
+	// case <-called:
+	// 	<-sent
+	case <-sent:
+		return
+	}
+
 }
 
 func (s *Server) Register(serviceStruct interface{}) error {
@@ -178,4 +214,30 @@ func (s *Server) FindService(serviceMethod string) (*service, *MethodType, error
 		return nil, nil, errors.New("server: service method " + methodName + " can't be found")
 	}
 	return service, methodType, nil
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, request *http.Request) {
+	if request.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		logrus.Error("rpc hijacking ", request.RemoteAddr, ": ", err.Error())
+		return
+	}
+	io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	s.handleConn(conn)
+}
+
+func (s *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, s)
+	http.Handle(defaultDebugPath, debugHTTP{s})
+	logrus.Info("server debug path: ", defaultDebugPath)
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }

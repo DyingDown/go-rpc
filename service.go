@@ -61,7 +61,6 @@ func NewService(serviceStruct interface{}) *service {
 
 func (s *service) registerMethods() {
 	for i := 0; i < s.serviceType.NumMethod(); i++ {
-		logrus.Info(i)
 		method := s.serviceType.Method(i)
 		methodType := method.Type
 		if methodType.NumIn() != 3 || methodType.NumOut() != 1 {
