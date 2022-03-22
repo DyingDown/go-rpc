@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	gorpc "go-rpc"
+	"go-rpc/registry"
 	"go-rpc/xclient"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -31,12 +34,20 @@ func (f Foo) Sleep(arg Args, reply *int) error {
 	return nil
 }
 
-func StartServer(addr chan string) {
+func StartRegistry(ch chan string) {
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	registry.HandleHTTP()
+	ch <- l.Addr().String()
+	http.Serve(l, nil)
+}
+
+func StartServer(registryAddr string, wg *sync.WaitGroup) {
 	var foo Foo
 	listener, _ := net.Listen("tcp", "127.0.0.1:0")
 	server := gorpc.NewServer()
 	server.Register(&foo)
-	addr <- listener.Addr().String()
+	registry.Hearbeat(registryAddr, "tcp@"+listener.Addr().String(), 0)
+	wg.Done()
 	server.Accept(listener)
 }
 
@@ -54,8 +65,9 @@ func foo(xc *xclient.XClient, cntxt context.Context, typ, serviceMethod string, 
 		logrus.Infof("%s %s success: %d + %d = %d", typ, serviceMethod, args.A, args.B, reply)
 	}
 }
-func call(addr1, addr2 string) {
-	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+
+func call(registry string) {
+	d := xclient.NewRegistryDiscovery(registry, 0)
 	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 	defer xc.Close()
 	var wg sync.WaitGroup
@@ -69,8 +81,8 @@ func call(addr1, addr2 string) {
 	wg.Wait()
 }
 
-func broadcast(addr1, addr2 string) {
-	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+func broadcast(registry string) {
+	d := xclient.NewRegistryDiscovery(registry, 0)
 	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 	defer xc.Close()
 	var wg sync.WaitGroup
@@ -86,16 +98,21 @@ func broadcast(addr1, addr2 string) {
 	wg.Wait()
 }
 func main() {
-	addr1 := make(chan string)
-	addr2 := make(chan string)
-	go StartServer(addr1)
-	go StartServer(addr2)
-
-	ad1 := <-addr1
-	ad2 := <-addr2
+	var wg sync.WaitGroup
+	registryAddrCh := make(chan string)
+	go StartRegistry(registryAddrCh)
+	registryAddr := <-registryAddrCh
+	registryAddr = fmt.Sprintf("http://%s%s", registryAddr, registry.DefaultPath)
 	time.Sleep(time.Second)
-	call(ad1, ad2)
-	broadcast(ad1, ad2)
+	wg.Add(2)
+	go StartServer(registryAddr, &wg)
+	go StartServer(registryAddr, &wg)
+
+	wg.Wait()
+
+	time.Sleep(time.Second)
+	call(registryAddr)
+	broadcast(registryAddr)
 }
 
 // 设置 log 输出格式

@@ -2,6 +2,8 @@ package codec
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"io"
 
@@ -10,7 +12,7 @@ import (
 
 type GobCodec struct {
 	conn io.ReadWriteCloser
-	buff *bufio.Writer
+	buff *bufio.ReadWriter
 	dec  *gob.Decoder
 	enc  *gob.Encoder
 }
@@ -18,21 +20,33 @@ type GobCodec struct {
 var _ Codec = (*GobCodec)(nil)
 
 func NewGobCodec(conn io.ReadWriteCloser) Codec {
-	buf := bufio.NewWriter(conn)
+	readbuf := bufio.NewReader(conn)
+	writebuf := bufio.NewWriter(conn)
+	buf := bufio.NewReadWriter(readbuf, writebuf)
 	return &GobCodec{
-		conn: conn,
 		buff: buf,
+		conn: conn,
 		dec:  gob.NewDecoder(conn),
-		enc:  gob.NewEncoder(buf),
+		enc:  gob.NewEncoder(conn),
 	}
 }
 
 func (codec *GobCodec) ReadHeader(h *Header) error {
-	return codec.dec.Decode(h)
+	var length uint32
+	binary.Read(codec.buff, binary.BigEndian, &length)
+	raw := make([]byte, length)
+	codec.buff.Read(raw)
+	buf := bytes.NewBuffer(raw)
+	return gob.NewDecoder(buf).Decode(h)
 }
 
 func (codec *GobCodec) ReadBody(body interface{}) error {
-	return codec.dec.Decode(body)
+	var length uint32
+	binary.Read(codec.buff, binary.BigEndian, &length)
+	raw := make([]byte, length)
+	codec.buff.Read(raw)
+	buf := bytes.NewBuffer(raw)
+	return gob.NewDecoder(buf).Decode(body)
 }
 
 func (codec *GobCodec) Write(h *Header, body interface{}) (err error) {
@@ -42,14 +56,20 @@ func (codec *GobCodec) Write(h *Header, body interface{}) (err error) {
 			codec.Close()
 		}
 	}()
-	if err := codec.enc.Encode(h); err != nil {
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(h); err != nil {
 		logrus.Errorf("fail to encode header: %v", err)
 		return err
 	}
-	if err := codec.enc.Encode(body); err != nil {
+	binary.Write(codec.buff, binary.BigEndian, uint32(buf.Len()))
+	codec.buff.Write(buf.Bytes())
+	buf.Reset()
+	if err := gob.NewEncoder(buf).Encode(body); err != nil {
 		logrus.Errorf("fail to encode body: %v", err)
 		return err
 	}
+	binary.Write(codec.buff, binary.BigEndian, uint32(buf.Len()))
+	codec.buff.Write(buf.Bytes())
 	return nil
 }
 

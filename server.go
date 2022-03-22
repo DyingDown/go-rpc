@@ -77,6 +77,10 @@ func (s *Server) handleConn(conn io.ReadWriteCloser) {
 		logrus.Errorf("invalid magic number: %v", option.MagicNumber)
 		return
 	}
+	if err := json.NewEncoder(conn).Encode(option); err != nil {
+		logrus.Error(err)
+		return
+	}
 	codecfunc := codec.NewCodecFuncMap[option.CodecType]
 	if codecfunc == nil {
 		logrus.Errorf("invalid codec type: %v", option.CodecType)

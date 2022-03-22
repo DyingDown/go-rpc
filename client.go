@@ -133,6 +133,12 @@ func NewClient(conn net.Conn, option *Option) (*Client, error) {
 		logrus.Errorf("client error: %v", err)
 		return nil, err
 	}
+	if err := json.NewEncoder(conn).Encode(option); err != nil {
+		return nil, err
+	}
+	if err := json.NewDecoder(conn).Decode(option); err != nil {
+		return nil, err
+	}
 	enc := json.NewEncoder(conn)
 	err := enc.Encode(option)
 	if err != nil {
